@@ -8,12 +8,13 @@ set -o pipefail
 BASE_DIR="/root/ddns"
 CONF_FILE="$BASE_DIR/config.env"
 CACHE_FILE="$BASE_DIR/cache.env"
-RUN_LOG="$BASE_DIR/run.log"
 
-LOG_PREFIX="chip"          # 变更日志前缀：chip_YYYY-MM-DD.log
-CHANGE_KEEP_DAYS=3         # 变更日志最多保留3天（含今天）
+FAIL_LOG_PREFIX="run"              # 失败日志：run_YYYY-MM-DD.log（每天一个）
+FAIL_KEEP_DAYS=3                   # 失败日志最多保留3天（第4天删最早）
+CHANGE_LOG_FILE="$BASE_DIR/chip.log"  # 变更日志：单文件
+CHANGE_KEEP_DAYS=30                # 变更日志仅保留近30天（按记录时间裁剪）
+
 LOCK_DIR="$BASE_DIR/.lock"
-
 CF_API_BASE="https://api.cloudflare.com/client/v4"
 
 # -------------------------
@@ -26,28 +27,51 @@ ensure_base_dir() {
 
 bj_now() { TZ="Asia/Shanghai" date "+%Y-%m-%d %H:%M:%S"; }
 bj_day() { TZ="Asia/Shanghai" date "+%Y-%m-%d"; }
+bj_epoch() { TZ="Asia/Shanghai" date "+%s"; }
+
+fail_log_file() {
+  echo "$BASE_DIR/${FAIL_LOG_PREFIX}_$(bj_day).log"
+}
 
 log_fail() {
+  # 只记失败，写到当天（北京时间）文件
   ensure_base_dir
-  local ts msg
+  local ts msg f
   ts="$(bj_now)"
   msg="$*"
-  printf "[%s] FAIL %s\n" "$ts" "$msg" >> "$RUN_LOG"
+  f="$(fail_log_file)"
+  printf "[%s] FAIL %s\n" "$ts" "$msg" >> "$f"
 }
 
-change_log_file() { echo "$BASE_DIR/${LOG_PREFIX}_$(bj_day).log"; }
+prune_fail_logs() {
+  # 保留最近 FAIL_KEEP_DAYS 天（含今天）：mtime +2 即删除更早（保留0/1/2天=3天）
+  local keep_plus=$((FAIL_KEEP_DAYS - 1))
+  find "$BASE_DIR" -maxdepth 1 -type f -name "${FAIL_LOG_PREFIX}_*.log" -mtime "+${keep_plus}" -delete 2>/dev/null || true
+}
 
 log_change() {
+  # 只在 IP 发生创建/更新时调用；写入 chip.log（单文件）
   ensure_base_dir
-  local f ts
-  f="$(change_log_file)"
+  local epoch ts
+  epoch="$(bj_epoch)"
   ts="$(bj_now)"
-  printf "[%s] %s\n" "$ts" "$*" >> "$f"
+  # 写入：epoch + 北京时间 + 内容（epoch 用于做30天裁剪，跨发行版更稳）
+  printf "%s [%s] %s\n" "$epoch" "$ts" "$*" >> "$CHANGE_LOG_FILE"
+  prune_change_log_30d
 }
 
-prune_change_logs() {
-  local keep_plus=$((CHANGE_KEEP_DAYS - 1))
-  find "$BASE_DIR" -maxdepth 1 -type f -name "${LOG_PREFIX}_*.log" -mtime "+${keep_plus}" -delete 2>/dev/null || true
+prune_change_log_30d() {
+  # 仅保留近30天（按每行开头 epoch 数字裁剪）
+  [ -f "$CHANGE_LOG_FILE" ] || return 0
+  local now cut
+  now="$(bj_epoch)"
+  cut=$((now - CHANGE_KEEP_DAYS*86400))
+
+  # 只保留：首字段为数字且 >= cut 的行
+  #（旧格式/异常行会被丢弃，避免无限膨胀）
+  awk -v cut="$cut" '
+    $1 ~ /^[0-9]+$/ && $1 >= cut {print}
+  ' "$CHANGE_LOG_FILE" > "${CHANGE_LOG_FILE}.tmp" 2>/dev/null && mv -f "${CHANGE_LOG_FILE}.tmp" "$CHANGE_LOG_FILE"
 }
 
 say() { printf "%s\n" "$*"; }
@@ -146,7 +170,7 @@ load_config() {
 
   CF_AUTH_MODE="${CF_AUTH_MODE:-global}"
   ENABLE_IPV4="${ENABLE_IPV4:-1}"
-  ENABLE_IPV6="${ENABLE_IPV6:-0}"   # ✅ 更安全：默认不启用 IPv6
+  ENABLE_IPV6="${ENABLE_IPV6:-0}"   # 默认不启用 IPv6（避免无 v6 环境报错）
   PROXIED="${PROXIED:-false}"
   TTL="${TTL:-1}"
 
@@ -165,7 +189,7 @@ write_config_interactive() {
   umask 077
 
   say "========== Cloudflare DDNS 配置 =========="
-  say "支持两种认证："
+  say "认证方式："
   say "  1) Global API Key（CF_EMAIL + CF_API_KEY）"
   say "  2) API Token（更推荐，更安全）"
   say ""
@@ -192,7 +216,7 @@ write_config_interactive() {
   read -r -p 'CFRECORD_NAME="home.example.com": ' CFRECORD_NAME_in
 
   say ""
-  say "更新模式（防止没 IPv6 也被当错误）："
+  say "更新模式（没 IPv6 就选“只更新 IPv4”，不会写失败日志）："
   say "  1) 只更新 IPv4 (A)"
   say "  2) 只更新 IPv6 (AAAA)"
   say "  3) IPv4 + IPv6 都更新"
@@ -202,7 +226,7 @@ write_config_interactive() {
   case "$ipmode" in
     2) ENABLE_IPV4_in="0"; ENABLE_IPV6_in="1" ;;
     3) ENABLE_IPV4_in="1"; ENABLE_IPV6_in="1" ;;
-    *) ENABLE_IPV4_in="1"; ENABLE_IPV6_in="0" ;;  # 默认只启 IPv4
+    *) ENABLE_IPV4_in="1"; ENABLE_IPV6_in="0" ;;
   esac
 
   read -r -p "Cloudflare 代理（橙云）？[true/false]（默认false）: " PROXIED_in
@@ -241,7 +265,6 @@ EOF
 # IP Detect
 # -------------------------
 trim() { sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
-
 valid_ipv4() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
 valid_ipv6() { [[ "$1" =~ : ]]; }
 
@@ -412,7 +435,8 @@ ddns_update_one() {
 
 run_once() {
   ensure_base_dir
-  prune_change_logs
+  prune_fail_logs
+  prune_change_log_30d
 
   ensure_deps || return 1
   load_config || {
@@ -420,6 +444,12 @@ run_once() {
     say "[HINT] 运行：bash ddns.sh 进入交互配置"
     return 1
   }
+
+  if [ "${ENABLE_IPV4}" != "1" ] && [ "${ENABLE_IPV6}" != "1" ]; then
+    say "[ERR] 配置错误：IPv4/IPv6 都未启用（请重新配置）"
+    log_fail "配置错误：IPv4/IPv6 都未启用"
+    return 1
+  fi
 
   acquire_lock || return 0
 
@@ -437,7 +467,7 @@ run_once() {
       say "[INFO] 读取到公网 IPv4：$v4"
       ddns_update_one "A" "$v4" || rc=1
     else
-      say "[WARN] 未能获取公网 IPv4（可能无 IPv4 出口）"
+      say "[ERR] 未能获取公网 IPv4（A 记录无法更新）"
       log_fail "获取IPv4失败（A记录无法更新）"
       rc=1
     fi
@@ -450,9 +480,8 @@ run_once() {
       say "[INFO] 读取到公网 IPv6：$v6"
       ddns_update_one "AAAA" "$v6" || rc=1
     else
-      # ✅ 只有当你配置“启用 IPv6”时，这才算失败；如果你不想它报错，就在交互里选“只更新 IPv4”
-      say "[WARN] 未能获取公网 IPv6（可能无 IPv6 出口）"
-      log_fail "获取IPv6失败（AAAA记录无法更新；如无IPv6请禁用IPv6）"
+      say "[ERR] 未能获取公网 IPv6（AAAA 记录无法更新）"
+      log_fail "获取IPv6失败（AAAA记录无法更新；如无IPv6请在交互里选择“只更新IPv4”）"
       rc=1
     fi
     say ""
@@ -461,7 +490,7 @@ run_once() {
   if [ "$rc" -eq 0 ]; then
     say "========== 完成：全部成功 =========="
   else
-    say "========== 完成：存在失败（详见 $RUN_LOG） =========="
+    say "========== 完成：存在失败（失败详情见：$(fail_log_file)） =========="
   fi
 
   return "$rc"
@@ -525,8 +554,8 @@ uninstall_cron() {
 
 show_paths() {
   say "配置文件：$CONF_FILE"
-  say "失败日志：$RUN_LOG"
-  say "变更日志：$BASE_DIR/${LOG_PREFIX}_YYYY-MM-DD.log（北京时间，每天一个，保留${CHANGE_KEEP_DAYS}天）"
+  say "失败日志：$BASE_DIR/${FAIL_LOG_PREFIX}_YYYY-MM-DD.log（北京时间，每天一个，保留${FAIL_KEEP_DAYS}天）"
+  say "变更日志：$CHANGE_LOG_FILE（仅IP变更追加，保留近${CHANGE_KEEP_DAYS}天记录）"
 }
 
 usage() {
@@ -538,8 +567,6 @@ usage() {
   bash ddns.sh --install-cron  # 安装每1分钟执行的 cron
   bash ddns.sh --uninstall-cron# 移除 cron
   bash ddns.sh --show-paths    # 显示配置/日志路径
-
-所有配置与日志固定在：/root/ddns/
 EOF
 }
 
