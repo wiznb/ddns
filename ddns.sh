@@ -1,347 +1,591 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# Cloudflare DDNS (IPv4+IPv6) for CentOS/Debian/Ubuntu/Alpine
+# Config/logs live in: /root/ddns
 
-# =========================
-# Cloudflare DDNS (Global API Key) - Interactive + --run
-# Config & logs in: /root/ddns
-# Run interactive:  bash ddns.sh
-# Run cron mode:    bash ddns.sh --run
-# Works on: CentOS/Debian/Ubuntu/Alpine
-# =========================
+set -u
+set -o pipefail
 
 BASE_DIR="/root/ddns"
-CONFIG_FILE="${BASE_DIR}/config.env"
-LOG_FILE="${BASE_DIR}/ip_changes.log"
-RUN_LOG="${BASE_DIR}/run.log"
+CONF_FILE="$BASE_DIR/config.env"
+CACHE_FILE="$BASE_DIR/cache.env"
+RUN_LOG="$BASE_DIR/run.log"
 
-TZ_BEIJING="Asia/Shanghai"
+LOG_PREFIX="chip"          # 变更日志前缀：chip_YYYY-MM-DD.log
+CHANGE_KEEP_DAYS=3         # 变更日志最多保留3天（含今天）
+LOCK_DIR="$BASE_DIR/.lock"
 
-die() { echo "[ERR] $*" >&2; exit 1; }
-info() { echo "[INFO] $*"; }
-warn() { echo "[WARN] $*" >&2; }
+CF_API_BASE="https://api.cloudflare.com/client/v4"
 
-need_cmd() { command -v "$1" >/dev/null 2>&1 || die "缺少命令：$1（请安装）"; }
-
-mkdir -p "$BASE_DIR" || die "无法创建目录：$BASE_DIR"
-
-need_cmd curl
-need_cmd awk
-need_cmd sed
-need_cmd date
-
-HAS_JQ=0
-if command -v jq >/dev/null 2>&1; then HAS_JQ=1; fi
-
-now_beijing() { TZ="$TZ_BEIJING" date "+%Y-%m-%d %H:%M:%S %Z"; }
-
-cleanup_log_30d() {
-  [[ -f "$LOG_FILE" ]] || return 0
-  local cutoff
-  cutoff="$(TZ="$TZ_BEIJING" date -d "30 days ago" "+%Y-%m-%d" 2>/dev/null || true)"
-  if [[ -z "$cutoff" ]]; then
-    # Alpine busybox date fallback: keep last N lines
-    tail -n 2000 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
-    return 0
-  fi
-  awk -v c="$cutoff" '
-    length($1)==10 && $1>=c { print; next }
-    length($1)!=10 { print }
-  ' "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
+# -------------------------
+# Utils
+# -------------------------
+ensure_base_dir() {
+  mkdir -p "$BASE_DIR"
+  chmod 700 "$BASE_DIR" 2>/dev/null || true
 }
 
-http_get() { curl -fsS --connect-timeout 5 --max-time 15 "$1"; }
+bj_now() { TZ="Asia/Shanghai" date "+%Y-%m-%d %H:%M:%S"; }
+bj_day() { TZ="Asia/Shanghai" date "+%Y-%m-%d"; }
 
-detect_ipv4() {
-  local ip=""
-  ip="$(http_get "https://api.ipify.org" 2>/dev/null || true)"
-  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || ip="$(http_get "https://ipv4.icanhazip.com" 2>/dev/null | tr -d ' \n\r' || true)"
-  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || ip="$(http_get "https://ifconfig.me/ip" 2>/dev/null | tr -d ' \n\r' || true)"
-  echo "$ip"
+log_fail() {
+  ensure_base_dir
+  local ts msg
+  ts="$(bj_now)"
+  msg="$*"
+  printf "[%s] FAIL %s\n" "$ts" "$msg" >> "$RUN_LOG"
 }
 
-detect_ipv6() {
-  local ip=""
-  ip="$(http_get "https://api64.ipify.org" 2>/dev/null || true)"
-  [[ "$ip" =~ : ]] || ip="$(http_get "https://ipv6.icanhazip.com" 2>/dev/null | tr -d ' \n\r' || true)"
-  echo "$ip"
+change_log_file() { echo "$BASE_DIR/${LOG_PREFIX}_$(bj_day).log"; }
+
+log_change() {
+  ensure_base_dir
+  local f ts
+  f="$(change_log_file)"
+  ts="$(bj_now)"
+  printf "[%s] %s\n" "$ts" "$*" >> "$f"
 }
 
-# ---- Cloudflare API (Global Key) ----
-cf_api() {
-  local method="$1"; shift
-  local url="https://api.cloudflare.com/client/v4$1"; shift
-  local data="${1:-}"
+prune_change_logs() {
+  local keep_plus=$((CHANGE_KEEP_DAYS - 1))
+  find "$BASE_DIR" -maxdepth 1 -type f -name "${LOG_PREFIX}_*.log" -mtime "+${keep_plus}" -delete 2>/dev/null || true
+}
 
-  if [[ -n "$data" ]]; then
-    curl -fsS --connect-timeout 5 --max-time 25 \
-      -X "$method" "$url" \
-      -H "X-Auth-Email: ${CF_EMAIL}" \
-      -H "X-Auth-Key: ${CF_API_KEY}" \
-      -H "Content-Type: application/json" \
-      --data "$data"
-  else
-    curl -fsS --connect-timeout 5 --max-time 25 \
-      -X "$method" "$url" \
-      -H "X-Auth-Email: ${CF_EMAIL}" \
-      -H "X-Auth-Key: ${CF_API_KEY}" \
-      -H "Content-Type: application/json"
+say() { printf "%s\n" "$*"; }
+need_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+detect_pkg_mgr() {
+  if need_cmd apt-get; then echo "apt"
+  elif need_cmd dnf; then echo "dnf"
+  elif need_cmd yum; then echo "yum"
+  elif need_cmd apk; then echo "apk"
+  else echo "none"
   fi
 }
 
-print_banner() {
-  echo "==========================================="
-  echo " Cloudflare DDNS (Global API Key)"
-  echo " 配置/日志目录：${BASE_DIR}"
-  echo " 交互模式：bash ddns.sh"
-  echo " 定时模式：bash ddns.sh --run"
-  echo "==========================================="
-}
-
-load_config_if_exists() {
-  if [[ -f "$CONFIG_FILE" ]]; then
-    # shellcheck disable=SC1090
-    source "$CONFIG_FILE"
-    return 0
+install_deps() {
+  if [ "$(id -u)" -ne 0 ]; then
+    say "[ERR] 安装依赖需要 root。请用 root 执行：bash ddns.sh --install-deps"
+    return 1
   fi
-  return 1
+
+  local pm
+  pm="$(detect_pkg_mgr)"
+
+  case "$pm" in
+    apt)
+      say "[INFO] 使用 apt 安装依赖：curl jq cron bash"
+      apt-get update -y
+      DEBIAN_FRONTEND=noninteractive apt-get install -y curl jq cron bash
+      ;;
+    dnf)
+      say "[INFO] 使用 dnf 安装依赖：curl jq cronie bash"
+      dnf install -y curl jq cronie bash
+      ;;
+    yum)
+      say "[INFO] 使用 yum 安装依赖：curl jq cronie bash"
+      yum install -y curl jq cronie bash
+      ;;
+    apk)
+      say "[INFO] 使用 apk 安装依赖：bash curl jq dcron"
+      apk add --no-cache bash curl jq dcron
+      ;;
+    *)
+      say "[ERR] 未识别的包管理器，无法自动安装。请手动安装：bash curl jq（以及 cron）"
+      return 1
+      ;;
+  esac
+
+  say "[OK] 依赖安装完成。"
+  return 0
 }
 
-save_config() {
-  umask 077
-  cat > "$CONFIG_FILE" <<EOF
-# Cloudflare DDNS config (saved at $(now_beijing))
-CF_API_KEY="${CF_API_KEY}"
-CF_EMAIL="${CF_EMAIL}"
-CFZONE_NAME="${CFZONE_NAME}"
-CFRECORD_NAME="${CFRECORD_NAME}"
-CF_RECORD_TYPE="${CF_RECORD_TYPE}"
-CF_TTL="${CF_TTL}"
-CF_PROXIED="${CF_PROXIED}"
-EOF
-  info "配置已保存：$CONFIG_FILE"
-}
-
-prompt_input() {
-  local var="$1"
-  local prompt="$2"
-  local def="${3:-}"
-  local secret="${4:-0}"
-  local val=""
-
-  if [[ "$secret" == "1" ]]; then
-    if [[ -n "$def" ]]; then
-      read -r -s -p "${prompt} (回车保留已设)：" val; echo
-      val="${val:-$def}"
-    else
-      read -r -s -p "${prompt}：" val; echo
+ensure_deps() {
+  local missing=0
+  for c in curl jq; do
+    if ! need_cmd "$c"; then
+      say "[WARN] 缺少依赖：$c"
+      missing=1
     fi
-  else
-    if [[ -n "$def" ]]; then
-      read -r -p "${prompt} [默认: ${def}]：" val
-      val="${val:-$def}"
-    else
-      read -r -p "${prompt}：" val
-    fi
-  fi
-
-  [[ -n "$val" ]] || die "输入不能为空：$var"
-  printf -v "$var" '%s' "$val"
-}
-
-interactive_setup() {
-  print_banner
-  echo "[设置] 请输入 Cloudflare 信息（首次/修改时需要）"
-  echo
-
-  local cur_key="${CF_API_KEY:-}"
-  local cur_email="${CF_EMAIL:-}"
-  local cur_zone="${CFZONE_NAME:-}"
-  local cur_record="${CFRECORD_NAME:-}"
-  local cur_type="${CF_RECORD_TYPE:-A}"
-  local cur_ttl="${CF_TTL:-120}"
-  local cur_prox="${CF_PROXIED:-false}"
-
-  prompt_input CF_API_KEY "CF_API_KEY(Global API Key)" "$cur_key" 1
-  prompt_input CF_EMAIL "CF_EMAIL(Cloudflare邮箱)" "$cur_email" 0
-  prompt_input CFZONE_NAME "CFZONE_NAME(如 example.com)" "$cur_zone" 0
-  prompt_input CFRECORD_NAME "CFRECORD_NAME(如 home.example.com，全名)" "$cur_record" 0
-
-  read -r -p "记录类型 A(IPv4) / AAAA(IPv6) [默认: ${cur_type}]：" CF_RECORD_TYPE
-  CF_RECORD_TYPE="${CF_RECORD_TYPE:-$cur_type}"
-  [[ "$CF_RECORD_TYPE" == "A" || "$CF_RECORD_TYPE" == "AAAA" ]] || die "记录类型只能是 A 或 AAAA"
-
-  read -r -p "TTL(秒，1=Auto) [默认: ${cur_ttl}]：" CF_TTL
-  CF_TTL="${CF_TTL:-$cur_ttl}"
-  [[ "$CF_TTL" =~ ^[0-9]+$ ]] || die "TTL 必须是数字"
-
-  read -r -p "是否开启代理 proxied true/false [默认: ${cur_prox}]：" CF_PROXIED
-  CF_PROXIED="${CF_PROXIED:-$cur_prox}"
-  [[ "$CF_PROXIED" == "true" || "$CF_PROXIED" == "false" ]] || die "proxied 只能是 true 或 false"
-
-  save_config
-}
-
-show_menu() {
-  echo
-  echo "1) 直接执行 DDNS 更新"
-  echo "2) 修改/重新输入配置"
-  echo "3) 查看最近 20 条 IP 变更日志"
-  echo "4) 退出"
-  echo
-}
-
-show_current_config_masked() {
-  echo "当前配置："
-  echo "  CF_EMAIL       = ${CF_EMAIL:-<未设置>}"
-  echo "  CFZONE_NAME    = ${CFZONE_NAME:-<未设置>}"
-  echo "  CFRECORD_NAME  = ${CFRECORD_NAME:-<未设置>}"
-  echo "  CF_RECORD_TYPE = ${CF_RECORD_TYPE:-<未设置>}"
-  echo "  CF_TTL         = ${CF_TTL:-<未设置>}"
-  echo "  CF_PROXIED     = ${CF_PROXIED:-<未设置>}"
-  if [[ -n "${CF_API_KEY:-}" ]]; then
-    echo "  CF_API_KEY     = 已设置（已隐藏）"
-  else
-    echo "  CF_API_KEY     = <未设置>"
-  fi
-}
-
-validate_config() {
-  [[ -n "${CF_API_KEY:-}" ]] || die "未设置 CF_API_KEY"
-  [[ -n "${CF_EMAIL:-}" ]] || die "未设置 CF_EMAIL"
-  [[ -n "${CFZONE_NAME:-}" ]] || die "未设置 CFZONE_NAME"
-  [[ -n "${CFRECORD_NAME:-}" ]] || die "未设置 CFRECORD_NAME"
-  [[ "${CF_RECORD_TYPE:-}" == "A" || "${CF_RECORD_TYPE:-}" == "AAAA" ]] || die "CF_RECORD_TYPE 只能是 A 或 AAAA"
-  [[ "${CF_PROXIED:-}" == "true" || "${CF_PROXIED:-}" == "false" ]] || die "CF_PROXIED 只能是 true 或 false"
-  [[ "${CF_TTL:-}" =~ ^[0-9]+$ ]] || die "CF_TTL 必须是数字"
-}
-
-run_ddns_once() {
-  validate_config
-
-  print_banner
-  show_current_config_masked
-  echo
-
-  # ---- Step 1: public IP ----
-  local PUB_IP=""
-  if [[ "$CF_RECORD_TYPE" == "A" ]]; then
-    PUB_IP="$(detect_ipv4)"
-    [[ "$PUB_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "步骤1失败：获取公网 IPv4 失败（检查网络/出口/IPv4）"
-  else
-    PUB_IP="$(detect_ipv6)"
-    [[ "$PUB_IP" =~ : ]] || die "步骤1失败：获取公网 IPv6 失败（检查网络/出口/IPv6）"
-  fi
-  info "步骤1成功：检测到公网IP($CF_RECORD_TYPE)：$PUB_IP"
-
-  # ---- Step 2: zone id ----
-  local ZONE_JSON ZONE_ID
-  ZONE_JSON="$(cf_api GET "/zones?name=${CFZONE_NAME}&status=active&page=1&per_page=50" )" \
-    || die "步骤2失败：查询 Zone 失败（网络问题或 Key/邮箱错误）"
-
-  if [[ $HAS_JQ -eq 1 ]]; then
-    [[ "$(echo "$ZONE_JSON" | jq -r '.success')" == "true" ]] || die "步骤2失败：查询 Zone 返回 success=false：$(echo "$ZONE_JSON" | jq -c '.errors // empty')"
-    ZONE_ID="$(echo "$ZONE_JSON" | jq -r '.result[0].id // empty')"
-  else
-    ZONE_ID="$(echo "$ZONE_JSON" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p' | head -n1)"
-  fi
-  [[ -n "$ZONE_ID" ]] || die "步骤2失败：找不到 Zone：${CFZONE_NAME}（确认域名在该账号下且 active）"
-  info "步骤2成功：Zone匹配：$CFZONE_NAME -> $ZONE_ID"
-
-  # ---- Step 3: record id ----
-  local REC_JSON REC_ID CUR_IP
-  REC_JSON="$(cf_api GET "/zones/${ZONE_ID}/dns_records?type=${CF_RECORD_TYPE}&name=${CFRECORD_NAME}&page=1&per_page=100" )" \
-    || die "步骤3失败：查询 DNS Record 失败（检查权限/网络/记录名）"
-
-  if [[ $HAS_JQ -eq 1 ]]; then
-    [[ "$(echo "$REC_JSON" | jq -r '.success')" == "true" ]] || die "步骤3失败：查询 Record 返回 success=false：$(echo "$REC_JSON" | jq -c '.errors // empty')"
-    REC_ID="$(echo "$REC_JSON" | jq -r '.result[0].id // empty')"
-    CUR_IP="$(echo "$REC_JSON" | jq -r '.result[0].content // empty')"
-  else
-    REC_ID="$(echo "$REC_JSON" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p' | head -n1)"
-    CUR_IP="$(echo "$REC_JSON" | sed -n 's/.*"content":"\([^"]*\)".*/\1/p' | head -n1)"
-  fi
-
-  [[ -n "$REC_ID" ]] || die "步骤3失败：找不到记录：type=${CF_RECORD_TYPE}, name=${CFRECORD_NAME}（确认记录已存在且名称为全名）"
-  [[ -n "$CUR_IP" ]] || die "步骤3失败：无法读取当前记录 content（建议安装 jq）"
-
-  info "步骤3成功：当前解析：$CFRECORD_NAME -> $CUR_IP"
-
-  # ---- Step 4: compare/update ----
-  if [[ "$CUR_IP" == "$PUB_IP" ]]; then
-    info "步骤4：无需更新（公网IP与解析一致）"
-    return 0
-  fi
-
-  info "步骤4：需要更新：$CUR_IP -> $PUB_IP"
-
-  local UPDATE_JSON PUT_JSON
-  UPDATE_JSON="$(cat <<EOF
-{
-  "type": "${CF_RECORD_TYPE}",
-  "name": "${CFRECORD_NAME}",
-  "content": "${PUB_IP}",
-  "ttl": ${CF_TTL},
-  "proxied": ${CF_PROXIED}
-}
-EOF
-)"
-
-  PUT_JSON="$(cf_api PUT "/zones/${ZONE_ID}/dns_records/${REC_ID}" "$UPDATE_JSON")" \
-    || die "步骤4失败：更新请求失败（网络问题或权限不足）"
-
-  if [[ $HAS_JQ -eq 1 ]]; then
-    [[ "$(echo "$PUT_JSON" | jq -r '.success')" == "true" ]] || die "步骤4失败：更新失败：$(echo "$PUT_JSON" | jq -c '.errors // empty')"
-  else
-    echo "$PUT_JSON" | grep -q '"success":true' || die "步骤4失败：更新失败（建议安装 jq 查看 errors）"
-  fi
-
-  info "步骤4成功：更新成功：$CFRECORD_NAME -> $PUB_IP"
-
-  # ---- Log only on change ----
-  local TS
-  TS="$(now_beijing)"
-  echo "${TS} ${CFRECORD_NAME} ${CUR_IP} -> ${PUB_IP}" >> "$LOG_FILE"
-  cleanup_log_30d
-  info "已记录变更日志：$LOG_FILE（只记录变更，保留30天）"
-}
-
-main() {
-  # ---------- cron mode ----------
-  if [[ "${1:-}" == "--run" ]]; then
-    load_config_if_exists || die "未找到配置：$CONFIG_FILE。请先运行：bash ddns.sh 进行交互配置"
-    # 把输出也写到 /root/ddns/run.log（不影响你 cron 自己重定向）
-    {
-      echo "----- $(now_beijing) RUN -----"
-      run_ddns_once
-    } >> "$RUN_LOG" 2>&1
-    exit 0
-  fi
-
-  # ---------- interactive mode ----------
-  load_config_if_exists || true
-  if [[ -z "${CF_API_KEY:-}" || -z "${CF_EMAIL:-}" || -z "${CFZONE_NAME:-}" || -z "${CFRECORD_NAME:-}" ]]; then
-    interactive_setup
-  fi
-
-  while true; do
-    show_menu
-    read -r -p "请选择 [1-4]：" choice
-    case "${choice:-}" in
-      1) run_ddns_once ;;
-      2) interactive_setup ;;
-      3)
-        if [[ -f "$LOG_FILE" ]]; then
-          echo "---- 最近 20 条变更 ----"
-          tail -n 20 "$LOG_FILE"
-          echo "------------------------"
-        else
-          info "暂无变更日志：$LOG_FILE"
-        fi
-        ;;
-      4) exit 0 ;;
-      *) warn "无效选项：$choice" ;;
-    esac
   done
+
+  if ! need_cmd bash; then
+    say "[WARN] 系统可能没有 bash（Alpine 常见）。建议：apk add --no-cache bash"
+  fi
+
+  if [ "$missing" -eq 1 ]; then
+    say "[HINT] 可执行：bash ddns.sh --install-deps 自动安装依赖（需 root）。"
+    return 1
+  fi
+  return 0
 }
 
-main "$@"
+acquire_lock() {
+  ensure_base_dir
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    trap 'rm -rf "$LOCK_DIR" 2>/dev/null || true' EXIT
+    return 0
+  else
+    say "[WARN] 检测到已有任务在运行（锁：$LOCK_DIR），本次退出避免并发。"
+    return 1
+  fi
+}
+
+# -------------------------
+# Config
+# -------------------------
+load_config() {
+  if [ ! -f "$CONF_FILE" ]; then
+    return 1
+  fi
+
+  # shellcheck disable=SC1090
+  source "$CONF_FILE"
+
+  : "${CFZONE_NAME:?missing CFZONE_NAME}"
+  : "${CFRECORD_NAME:?missing CFRECORD_NAME}"
+
+  CF_AUTH_MODE="${CF_AUTH_MODE:-global}"
+  ENABLE_IPV4="${ENABLE_IPV4:-1}"
+  ENABLE_IPV6="${ENABLE_IPV6:-0}"   # ✅ 更安全：默认不启用 IPv6
+  PROXIED="${PROXIED:-false}"
+  TTL="${TTL:-1}"
+
+  if [ "$CF_AUTH_MODE" = "token" ]; then
+    : "${CF_API_TOKEN:?missing CF_API_TOKEN}"
+  else
+    : "${CF_EMAIL:?missing CF_EMAIL}"
+    : "${CF_API_KEY:?missing CF_API_KEY}"
+  fi
+
+  return 0
+}
+
+write_config_interactive() {
+  ensure_base_dir
+  umask 077
+
+  say "========== Cloudflare DDNS 配置 =========="
+  say "支持两种认证："
+  say "  1) Global API Key（CF_EMAIL + CF_API_KEY）"
+  say "  2) API Token（更推荐，更安全）"
+  say ""
+
+  read -r -p "选择认证方式 [1=GlobalKey, 2=Token]（默认1）: " mode
+  mode="${mode:-1}"
+
+  local CF_AUTH_MODE_in="global"
+  local CF_API_KEY_in="" CF_EMAIL_in="" CF_API_TOKEN_in=""
+  local CFZONE_NAME_in="" CFRECORD_NAME_in=""
+  local ENABLE_IPV4_in="1" ENABLE_IPV6_in="0"
+  local PROXIED_in="false" TTL_in="1"
+
+  if [ "$mode" = "2" ]; then
+    CF_AUTH_MODE_in="token"
+    read -r -p 'CF_API_TOKEN="你的API Token": ' CF_API_TOKEN_in
+  else
+    CF_AUTH_MODE_in="global"
+    read -r -p 'CF_API_KEY="你的GlobalAPIKey": ' CF_API_KEY_in
+    read -r -p 'CF_EMAIL="你的Cloudflare邮箱": ' CF_EMAIL_in
+  fi
+
+  read -r -p 'CFZONE_NAME="example.com": ' CFZONE_NAME_in
+  read -r -p 'CFRECORD_NAME="home.example.com": ' CFRECORD_NAME_in
+
+  say ""
+  say "更新模式（防止没 IPv6 也被当错误）："
+  say "  1) 只更新 IPv4 (A)"
+  say "  2) 只更新 IPv6 (AAAA)"
+  say "  3) IPv4 + IPv6 都更新"
+  read -r -p "请选择 [1/2/3]（默认1）: " ipmode
+  ipmode="${ipmode:-1}"
+
+  case "$ipmode" in
+    2) ENABLE_IPV4_in="0"; ENABLE_IPV6_in="1" ;;
+    3) ENABLE_IPV4_in="1"; ENABLE_IPV6_in="1" ;;
+    *) ENABLE_IPV4_in="1"; ENABLE_IPV6_in="0" ;;  # 默认只启 IPv4
+  esac
+
+  read -r -p "Cloudflare 代理（橙云）？[true/false]（默认false）: " PROXIED_in
+  PROXIED_in="${PROXIED_in:-false}"
+
+  read -r -p "TTL（1=auto）默认1: " TTL_in
+  TTL_in="${TTL_in:-1}"
+
+  cat > "$CONF_FILE" <<EOF
+# Cloudflare DDNS config (stored in /root/ddns)
+CF_AUTH_MODE="${CF_AUTH_MODE_in}"   # global | token
+
+# Global API Key mode:
+CF_API_KEY="${CF_API_KEY_in}"
+CF_EMAIL="${CF_EMAIL_in}"
+
+# API Token mode:
+CF_API_TOKEN="${CF_API_TOKEN_in}"
+
+CFZONE_NAME="${CFZONE_NAME_in}"
+CFRECORD_NAME="${CFRECORD_NAME_in}"
+
+# DDNS mode
+ENABLE_IPV4="${ENABLE_IPV4_in}"
+ENABLE_IPV6="${ENABLE_IPV6_in}"
+
+PROXIED="${PROXIED_in}"   # true/false
+TTL="${TTL_in}"           # 1 = auto
+EOF
+
+  chmod 600 "$CONF_FILE" 2>/dev/null || true
+  say "[OK] 已保存配置到：$CONF_FILE"
+}
+
+# -------------------------
+# IP Detect
+# -------------------------
+trim() { sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
+
+valid_ipv4() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+valid_ipv6() { [[ "$1" =~ : ]]; }
+
+get_ipv4() {
+  local ip=""
+  ip="$(curl -4 -fsS --max-time 6 https://api.ipify.org 2>/dev/null | trim || true)"
+  if [ -z "$ip" ]; then
+    ip="$(curl -4 -fsS --max-time 6 https://1.1.1.1/cdn-cgi/trace 2>/dev/null | awk -F= '/^ip=/{print $2}' | trim || true)"
+  fi
+  if [ -n "$ip" ] && valid_ipv4 "$ip"; then echo "$ip"; else echo ""; fi
+}
+
+get_ipv6() {
+  local ip=""
+  ip="$(curl -6 -fsS --max-time 6 https://api64.ipify.org 2>/dev/null | trim || true)"
+  if [ -z "$ip" ]; then
+    ip="$(curl -6 -fsS --max-time 6 https://1.1.1.1/cdn-cgi/trace 2>/dev/null | awk -F= '/^ip=/{print $2}' | trim || true)"
+  fi
+  if [ -n "$ip" ] && valid_ipv6 "$ip"; then echo "$ip"; else echo ""; fi
+}
+
+# -------------------------
+# Cloudflare API
+# -------------------------
+cf_headers() {
+  if [ "${CF_AUTH_MODE:-global}" = "token" ]; then
+    printf "Authorization: Bearer %s\n" "$CF_API_TOKEN"
+  else
+    printf "X-Auth-Email: %s\nX-Auth-Key: %s\n" "$CF_EMAIL" "$CF_API_KEY"
+  fi
+  printf "Content-Type: application/json\n"
+}
+
+cf_api() {
+  local method="$1" path="$2" data="${3:-}"
+  local url="${CF_API_BASE}${path}"
+  local -a hdr_args=()
+  local line
+
+  while IFS= read -r line; do
+    [ -n "$line" ] && hdr_args+=(-H "$line")
+  done < <(cf_headers)
+
+  if [ -n "$data" ]; then
+    curl -fsS -X "$method" "${hdr_args[@]}" --data "$data" "$url"
+  else
+    curl -fsS -X "$method" "${hdr_args[@]}" "$url"
+  fi
+}
+
+cache_get() {
+  local key="$1"
+  if [ -f "$CACHE_FILE" ]; then
+    # shellcheck disable=SC1090
+    source "$CACHE_FILE"
+    eval "echo \"\${$key:-}\""
+  else
+    echo ""
+  fi
+}
+
+cache_set() {
+  ensure_base_dir
+  local key="$1" val="$2"
+  touch "$CACHE_FILE"
+  chmod 600 "$CACHE_FILE" 2>/dev/null || true
+  grep -vE "^${key}=" "$CACHE_FILE" > "${CACHE_FILE}.tmp" 2>/dev/null || true
+  mv -f "${CACHE_FILE}.tmp" "$CACHE_FILE"
+  printf '%s="%s"\n' "$key" "$val" >> "$CACHE_FILE"
+}
+
+get_zone_id() {
+  local zid
+  zid="$(cache_get ZONE_ID)"
+  if [ -n "$zid" ]; then echo "$zid"; return 0; fi
+
+  local resp
+  resp="$(cf_api GET "/zones?name=${CFZONE_NAME}" 2>/dev/null)" || return 1
+  zid="$(echo "$resp" | jq -r '.result[0].id // empty')"
+  [ -n "$zid" ] && [ "$zid" != "null" ] || return 1
+  cache_set ZONE_ID "$zid"
+  echo "$zid"
+}
+
+get_record_info() {
+  local zid="$1" type="$2" name="$3"
+  local resp id content
+  resp="$(cf_api GET "/zones/${zid}/dns_records?type=${type}&name=${name}&per_page=1" 2>/dev/null)" || return 1
+  id="$(echo "$resp" | jq -r '.result[0].id // empty')"
+  content="$(echo "$resp" | jq -r '.result[0].content // empty')"
+  printf "%s|%s\n" "$id" "$content"
+}
+
+create_record() {
+  local zid="$1" type="$2" name="$3" content="$4"
+  local data resp id
+  data="$(jq -nc \
+    --arg type "$type" --arg name "$name" --arg content "$content" \
+    --argjson ttl "${TTL}" \
+    --argjson proxied "$( [ "$PROXIED" = "true" ] && echo true || echo false )" \
+    '{type:$type,name:$name,content:$content,ttl:$ttl,proxied:$proxied}')"
+  resp="$(cf_api POST "/zones/${zid}/dns_records" "$data" 2>/dev/null)" || return 1
+  id="$(echo "$resp" | jq -r '.result.id // empty')"
+  [ -n "$id" ] && echo "$id"
+}
+
+update_record() {
+  local zid="$1" rid="$2" type="$3" name="$4" content="$5"
+  local data resp ok
+  data="$(jq -nc \
+    --arg type "$type" --arg name "$name" --arg content "$content" \
+    --argjson ttl "${TTL}" \
+    --argjson proxied "$( [ "$PROXIED" = "true" ] && echo true || echo false )" \
+    '{type:$type,name:$name,content:$content,ttl:$ttl,proxied:$proxied}')"
+  resp="$(cf_api PUT "/zones/${zid}/dns_records/${rid}" "$data" 2>/dev/null)" || return 1
+  ok="$(echo "$resp" | jq -r '.success')"
+  [ "$ok" = "true" ]
+}
+
+ddns_update_one() {
+  local type="$1" ip="$2"
+
+  local zid
+  zid="$(get_zone_id)" || {
+    say "[ERR] 获取 Zone ID 失败（检查 CFZONE_NAME / 认证信息）"
+    log_fail "ZoneID 获取失败（zone=${CFZONE_NAME}, type=${type}）"
+    return 1
+  }
+
+  local info rid old
+  info="$(get_record_info "$zid" "$type" "$CFRECORD_NAME")" || {
+    say "[ERR] 查询 DNS Record 失败（type=$type name=$CFRECORD_NAME）"
+    log_fail "Record 查询失败（type=${type}, name=${CFRECORD_NAME}）"
+    return 1
+  }
+
+  rid="${info%%|*}"
+  old="${info#*|}"
+
+  if [ -z "$rid" ]; then
+    say "[INFO] 未找到 $type 记录，将创建：$CFRECORD_NAME -> $ip"
+    rid="$(create_record "$zid" "$type" "$CFRECORD_NAME" "$ip")" || {
+      say "[ERR] 创建记录失败（type=$type）"
+      log_fail "创建记录失败（type=${type}, name=${CFRECORD_NAME}, ip=${ip}）"
+      return 1
+    }
+    say "[OK] 已创建 $type 记录：$CFRECORD_NAME -> $ip"
+    log_change "CREATED ${type} ${CFRECORD_NAME} old=<none> new=${ip}"
+    return 0
+  fi
+
+  if [ "$old" = "$ip" ]; then
+    say "[OK] $type 无需更新：$CFRECORD_NAME 当前=$old"
+    return 0
+  fi
+
+  say "[INFO] 准备更新 $type：$CFRECORD_NAME $old -> $ip"
+  if update_record "$zid" "$rid" "$type" "$CFRECORD_NAME" "$ip"; then
+    say "[OK] 更新成功 $type：$CFRECORD_NAME $old -> $ip"
+    log_change "UPDATED ${type} ${CFRECORD_NAME} old=${old} new=${ip}"
+    return 0
+  else
+    say "[ERR] 更新失败 $type：$CFRECORD_NAME"
+    log_fail "更新失败（type=${type}, name=${CFRECORD_NAME}, old=${old}, new=${ip}）"
+    return 1
+  fi
+}
+
+run_once() {
+  ensure_base_dir
+  prune_change_logs
+
+  ensure_deps || return 1
+  load_config || {
+    say "[ERR] 找不到配置：$CONF_FILE"
+    say "[HINT] 运行：bash ddns.sh 进入交互配置"
+    return 1
+  }
+
+  acquire_lock || return 0
+
+  say "========== Cloudflare DDNS 执行（北京时间：$(bj_now)） =========="
+  say "[INFO] Zone:   $CFZONE_NAME"
+  say "[INFO] Record: $CFRECORD_NAME"
+  say "[INFO] IPv4:   ENABLE=${ENABLE_IPV4}  | IPv6: ENABLE=${ENABLE_IPV6}"
+  say ""
+
+  local rc=0 v4 v6
+
+  if [ "${ENABLE_IPV4}" = "1" ]; then
+    v4="$(get_ipv4)"
+    if [ -n "$v4" ]; then
+      say "[INFO] 读取到公网 IPv4：$v4"
+      ddns_update_one "A" "$v4" || rc=1
+    else
+      say "[WARN] 未能获取公网 IPv4（可能无 IPv4 出口）"
+      log_fail "获取IPv4失败（A记录无法更新）"
+      rc=1
+    fi
+    say ""
+  fi
+
+  if [ "${ENABLE_IPV6}" = "1" ]; then
+    v6="$(get_ipv6)"
+    if [ -n "$v6" ]; then
+      say "[INFO] 读取到公网 IPv6：$v6"
+      ddns_update_one "AAAA" "$v6" || rc=1
+    else
+      # ✅ 只有当你配置“启用 IPv6”时，这才算失败；如果你不想它报错，就在交互里选“只更新 IPv4”
+      say "[WARN] 未能获取公网 IPv6（可能无 IPv6 出口）"
+      log_fail "获取IPv6失败（AAAA记录无法更新；如无IPv6请禁用IPv6）"
+      rc=1
+    fi
+    say ""
+  fi
+
+  if [ "$rc" -eq 0 ]; then
+    say "========== 完成：全部成功 =========="
+  else
+    say "========== 完成：存在失败（详见 $RUN_LOG） =========="
+  fi
+
+  return "$rc"
+}
+
+# -------------------------
+# Cron install/uninstall
+# -------------------------
+cron_line() {
+  local script_path
+  script_path="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+  echo "* * * * * bash \"$script_path\" --run >/dev/null 2>&1 # CF_DDNS"
+}
+
+install_cron() {
+  ensure_deps || return 1
+  local line
+  line="$(cron_line)"
+
+  if need_cmd crontab; then
+    (crontab -l 2>/dev/null | grep -v ' # CF_DDNS$' ; echo "$line") | crontab -
+    say "[OK] 已安装 crontab（每1分钟执行一次）。"
+  else
+    if [ "$(id -u)" -ne 0 ]; then
+      say "[ERR] Alpine 写 /etc/crontabs/root 需要 root。"
+      return 1
+    fi
+    mkdir -p /etc/crontabs
+    touch /etc/crontabs/root
+    grep -v ' # CF_DDNS$' /etc/crontabs/root > /etc/crontabs/root.tmp 2>/dev/null || true
+    printf "%s\n" "$line" >> /etc/crontabs/root.tmp
+    mv -f /etc/crontabs/root.tmp /etc/crontabs/root
+    say "[OK] 已写入 /etc/crontabs/root（每1分钟执行一次）。"
+  fi
+
+  say ""
+  say "[HINT] 如果定时不生效，请确保 cron 服务在运行："
+  say "  - Debian/Ubuntu: systemctl enable --now cron"
+  say "  - CentOS/RHEL:   systemctl enable --now crond"
+  say "  - Alpine(OpenRC): rc-update add crond default && rc-service crond start"
+}
+
+uninstall_cron() {
+  if need_cmd crontab; then
+    (crontab -l 2>/dev/null | grep -v ' # CF_DDNS$') | crontab - 2>/dev/null || true
+    say "[OK] 已移除 crontab 里的 CF_DDNS 定时。"
+  else
+    if [ "$(id -u)" -ne 0 ]; then
+      say "[ERR] Alpine 修改 /etc/crontabs/root 需要 root。"
+      return 1
+    fi
+    if [ -f /etc/crontabs/root ]; then
+      grep -v ' # CF_DDNS$' /etc/crontabs/root > /etc/crontabs/root.tmp 2>/dev/null || true
+      mv -f /etc/crontabs/root.tmp /etc/crontabs/root
+      say "[OK] 已移除 /etc/crontabs/root 里的 CF_DDNS 定时。"
+    else
+      say "[INFO] 未发现 /etc/crontabs/root"
+    fi
+  fi
+}
+
+show_paths() {
+  say "配置文件：$CONF_FILE"
+  say "失败日志：$RUN_LOG"
+  say "变更日志：$BASE_DIR/${LOG_PREFIX}_YYYY-MM-DD.log（北京时间，每天一个，保留${CHANGE_KEEP_DAYS}天）"
+}
+
+usage() {
+  cat <<EOF
+用法：
+  bash ddns.sh                 # 交互界面（配置/执行/安装cron）
+  bash ddns.sh --run           # 执行一次 DDNS
+  bash ddns.sh --install-deps  # 安装依赖（curl/jq/cron/bash）
+  bash ddns.sh --install-cron  # 安装每1分钟执行的 cron
+  bash ddns.sh --uninstall-cron# 移除 cron
+  bash ddns.sh --show-paths    # 显示配置/日志路径
+
+所有配置与日志固定在：/root/ddns/
+EOF
+}
+
+interactive_menu() {
+  ensure_base_dir
+
+  if [ ! -f "$CONF_FILE" ]; then
+    write_config_interactive
+    say ""
+    run_once
+    say ""
+    show_paths
+    return 0
+  fi
+
+  say "========== Cloudflare DDNS =========="
+  say "1) 立即执行一次（--run）"
+  say "2) 重新配置（覆盖 config.env）"
+  say "3) 安装 cron（每1分钟）"
+  say "4) 移除 cron"
+  say "5) 显示配置/日志路径"
+  say "0) 退出"
+  read -r -p "请选择: " opt
+  case "${opt:-}" in
+    1) run_once ;;
+    2) write_config_interactive ;;
+    3) install_cron ;;
+    4) uninstall_cron ;;
+    5) show_paths ;;
+    0) exit 0 ;;
+    *) say "[ERR] 无效选择" ;;
+  esac
+}
+
+# -------------------------
+# main
+# -------------------------
+ensure_base_dir
+
+case "${1:-}" in
+  "" ) interactive_menu ;;
+  --run ) run_once ;;
+  --install-deps ) install_deps ;;
+  --install-cron ) install_cron ;;
+  --uninstall-cron ) uninstall_cron ;;
+  --show-paths ) show_paths ;;
+  -h|--help ) usage ;;
+  * ) usage; exit 1 ;;
+esac
